@@ -1,8 +1,6 @@
 #!/bin/bash
-# god_mode.sh - Исправленная версия (Server IP = .5)
+# god_mode.sh v3.0 - Fix IP Vanishing
 # Использование: ./god_mode.sh <РОЛЬ> <ID_СЕТИ>
-# Пример Server: ./god_mode.sh server 1
-# Пример Client: ./god_mode.sh client 1
 
 ROLE=$1
 ID=$2
@@ -13,11 +11,11 @@ if [[ -z "$ROLE" || -z "$ID" ]]; then
     exit 1
 fi
 
-# Пути (т.к. мы клоны CA, ключи уже тут)
+# Пути
 PKI_DIR="/etc/openvpn/easy-rsa/pki"
 EASY_RSA_DIR="/etc/openvpn/easy-rsa"
 
-# Определение подсетей по ID
+# Определение подсетей
 if [ "$ID" == "1" ]; then
     NET_PREFIX="10.0.10"
     VPN_SUBNET="10.8.1.0"
@@ -32,27 +30,58 @@ else
     exit 1
 fi
 
-# === ВАЖНОЕ ИЗМЕНЕНИЕ ===
-# Сервер теперь занимает адрес .5 (чтобы не драться с VirtualBox .1)
+# IP АДРЕСА (СЕРВЕР = .5, КЛИЕНТ = .2)
 SERVER_IP="${NET_PREFIX}.5"
-# Клиент занимает адрес .2
 CLIENT_IP="${NET_PREFIX}.2"
 
-# Поиск второго интерфейса (для локалки)
-# Берем второй интерфейс из списка (обычно enp0s8 или eth1)
+# Поиск интерфейса
 IFACE_INT=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | sed -n '2p')
 if [ -z "$IFACE_INT" ]; then
-    echo "ОШИБКА: Не найден второй сетевой адаптер для внутренней сети!"
-    exit 1
+    # Фолбек: пробуем найти enp0s8 явно
+    if ip link show enp0s8 > /dev/null 2>&1; then
+        IFACE_INT="enp0s8"
+    else
+        echo "ОШИБКА: Не найден второй адаптер! Проверь настройки VirtualBox."
+        exit 1
+    fi
 fi
 echo ">> Работаем с интерфейсом: $IFACE_INT"
 
+# Функция жесткого перезапуска сети
+hard_restart_net() {
+    local IP_ADDR=$1
+    local GW=$2
+    
+    echo ">> [NETWORK] Flush IP..."
+    ip addr flush dev $IFACE_INT
+    
+    echo ">> [NETWORK] Link Down/Up..."
+    ip link set $IFACE_INT down
+    ip link set $IFACE_INT up
+    
+    echo ">> [NETWORK] Restarting Service..."
+    systemctl restart network
+    
+    # СТРАХОВКА: Если IP не появился через 2 секунды, прибиваем его гвоздями
+    sleep 2
+    CURRENT_IP=$(ip a show $IFACE_INT | grep "inet ")
+    if [[ -z "$CURRENT_IP" ]]; then
+        echo ">> [WARNING] Network service тупит. Назначаю IP вручную!"
+        ip addr add $IP_ADDR/24 dev $IFACE_INT
+        ip link set $IFACE_INT up
+    fi
+    
+    # Проверка
+    echo ">> [STATUS] Текущий IP на $IFACE_INT:"
+    ip a show $IFACE_INT | grep inet
+}
+
+
 # === [2] ЛОГИКА ДЛЯ СЕРВЕРА ===
 if [ "$ROLE" == "server" ]; then
-    echo ">>> НАСТРОЙКА SERVER (Net $ID) <<<"
-    echo ">>> IP СЕРВЕРА БУДЕТ: $SERVER_IP <<<"
+    echo ">>> НАСТРОЙКА SERVER (Net $ID) -> IP $SERVER_IP <<<"
     
-    # 2.1 Настройка сети
+    # 2.1 Настройка конфига сети
     cat <<EOF > /etc/sysconfig/network-scripts/ifcfg-$IFACE_INT
 TYPE=Ethernet
 BOOTPROTO=static
@@ -61,18 +90,18 @@ DEVICE=$IFACE_INT
 ONBOOT=yes
 IPADDR=$SERVER_IP
 PREFIX=24
+NM_CONTROLLED=no
 EOF
-    # Сброс IP перед рестартом во избежание конфликтов
-    ip addr flush dev $IFACE_INT
-    systemctl restart network
+    
+    # Жесткий рестарт
+    hard_restart_net $SERVER_IP
 
     # 2.2 Копирование ключей
+    echo ">> [VPN] Настройка ключей..."
     mkdir -p /etc/openvpn/server
     cp $PKI_DIR/ca.crt /etc/openvpn/server/
     cp $PKI_DIR/dh.pem /etc/openvpn/server/
-    # Ищем ta.key
     [ -f "$EASY_RSA_DIR/ta.key" ] && cp $EASY_RSA_DIR/ta.key /etc/openvpn/server/ || cp $PKI_DIR/ta.key /etc/openvpn/server/
-    
     cp $PKI_DIR/issued/server$ID.crt /etc/openvpn/server/
     cp $PKI_DIR/private/server$ID.key /etc/openvpn/server/
 
@@ -98,37 +127,35 @@ verb 3
 explicit-exit-notify 1
 EOF
 
-    # 2.4 NAT
+    # 2.4 NAT & Firewall
+    echo ">> [FIREWALL] Открываем порты..."
     echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-ipforward.conf
     sysctl -p /etc/sysctl.d/99-ipforward.conf > /dev/null
-    # Находим WAN интерфейс (где есть инет)
-    IFACE_WAN=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -n 1)
     
-    # Чистка старых правил
-    systemctl start iptables
-    iptables -t nat -F
-    iptables -t nat -A POSTROUTING -s $VPN_SUBNET/24 -o $IFACE_WAN -j MASQUERADE
-    # Добавляем NAT для локальной сети тоже (на всякий случай)
-    iptables -t nat -A POSTROUTING -s ${NET_PREFIX}.0/24 -o $IFACE_WAN -j MASQUERADE
-    # Открываем порт 1194 (чтобы наверняка)
-    iptables -I INPUT -p udp --dport 1194 -j ACCEPT
-    service iptables save
+    IFACE_WAN=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
     
-    # Вырубаем firewalld (главного врага)
     systemctl stop firewalld
     systemctl disable firewalld
+    systemctl start iptables
+    
+    # Чистим и добавляем правила
+    iptables -t nat -F
+    iptables -t nat -A POSTROUTING -s $VPN_SUBNET/24 -o $IFACE_WAN -j MASQUERADE
+    iptables -t nat -A POSTROUTING -s ${NET_PREFIX}.0/24 -o $IFACE_WAN -j MASQUERADE
+    iptables -I INPUT -p udp --dport 1194 -j ACCEPT
+    service iptables save
 
     # 2.5 Запуск
+    echo ">> [VPN] Start..."
     systemctl enable openvpn-server@server
     systemctl restart openvpn-server@server
-    echo ">> СЕРВЕР ГОТОВ. IP: $SERVER_IP"
+    echo ">> ГОТОВО. IP: $SERVER_IP"
 
 # === [3] ЛОГИКА ДЛЯ КЛИЕНТА ===
 elif [ "$ROLE" == "client" ]; then
-    echo ">>> НАСТРОЙКА CLIENT (Net $ID) <<<"
-    echo ">>> ЦЕЛЬ СЕРВЕР: $SERVER_IP <<<"
+    echo ">>> НАСТРОЙКА CLIENT (Net $ID) -> IP $CLIENT_IP <<<"
 
-    # 3.1 Настройка сети (Шлюз = IP Сервера = .5)
+    # 3.1 Настройка сети
     cat <<EOF > /etc/sysconfig/network-scripts/ifcfg-$IFACE_INT
 TYPE=Ethernet
 BOOTPROTO=static
@@ -139,28 +166,23 @@ IPADDR=$CLIENT_IP
 PREFIX=24
 GATEWAY=$SERVER_IP
 DNS1=8.8.8.8
+NM_CONTROLLED=no
 EOF
-    # Сброс IP перед рестартом
-    ip addr flush dev $IFACE_INT
-    systemctl restart network
-    echo ">> Сеть перезапущена. Ждем 5 сек..."
-    sleep 5
     
-    # Принудительная чистка ARP (чтобы забыл старые MAC адреса шлюза)
+    # Жесткий рестарт
+    hard_restart_net $CLIENT_IP $SERVER_IP
+    
+    echo ">> Чистим ARP таблицу..."
     ip neigh flush all
 
-    # 3.2 Генерация конфига из локальных ключей
+    # 3.2 Генерация конфига
+    echo ">> [VPN] Генерируем конфиг..."
     CA_DATA=$(cat $PKI_DIR/ca.crt)
     CERT_DATA=$(cat $PKI_DIR/issued/client$ID.crt)
     KEY_DATA=$(cat $PKI_DIR/private/client$ID.key)
     
-    if [ -f "$EASY_RSA_DIR/ta.key" ]; then
-        TA_DATA=$(cat $EASY_RSA_DIR/ta.key)
-    else
-        TA_DATA=$(cat $PKI_DIR/ta.key)
-    fi
+    if [ -f "$EASY_RSA_DIR/ta.key" ]; then TA_DATA=$(cat $EASY_RSA_DIR/ta.key); else TA_DATA=$(cat $PKI_DIR/ta.key); fi
 
-    # Собираем единый файл
     cat <<EOF > /etc/openvpn/client.conf
 client
 dev tun
@@ -187,15 +209,20 @@ $TA_DATA
 EOF
 
     # 3.3 Запуск
-    echo ">> Запускаем OpenVPN клиент..."
+    echo ">> [VPN] Запуск клиента..."
     systemctl enable openvpn@client
     systemctl restart openvpn@client
     
-    echo ">> КЛИЕНТ ГОТОВ. IP: $CLIENT_IP. Шлюз: $SERVER_IP"
-    echo ">> Пробуем пинг гугла через туннель..."
-    sleep 3
+    echo ">> Ждем поднятия туннеля (5 сек)..."
+    sleep 5
     ping -c 2 8.8.8.8
+    if [ $? -eq 0 ]; then
+        echo ">> УСПЕХ! ИНТЕРНЕТ ЕСТЬ!"
+    else
+        echo ">> ПРОВЕРЬ: ping $SERVER_IP (должен работать)"
+    fi
+
 else
-    echo "Неверная роль! Используй 'server' или 'client'"
+    echo "Роли: server, client"
     exit 1
 fi

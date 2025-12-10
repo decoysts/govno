@@ -1,5 +1,5 @@
 #!/bin/bash
-# god_mode.sh - Один скрипт, чтобы править всеми
+# god_mode.sh - Исправленная версия (Server IP = .5)
 # Использование: ./god_mode.sh <РОЛЬ> <ID_СЕТИ>
 # Пример Server: ./god_mode.sh server 1
 # Пример Client: ./god_mode.sh client 1
@@ -32,8 +32,11 @@ else
     exit 1
 fi
 
-SERVER_IP="${NET_PREFIX}.1"
-CLIENT_IP="${NET_PREFIX}.2" # Клиент всегда будет .2
+# === ВАЖНОЕ ИЗМЕНЕНИЕ ===
+# Сервер теперь занимает адрес .5 (чтобы не драться с VirtualBox .1)
+SERVER_IP="${NET_PREFIX}.5"
+# Клиент занимает адрес .2
+CLIENT_IP="${NET_PREFIX}.2"
 
 # Поиск второго интерфейса (для локалки)
 # Берем второй интерфейс из списка (обычно enp0s8 или eth1)
@@ -47,6 +50,7 @@ echo ">> Работаем с интерфейсом: $IFACE_INT"
 # === [2] ЛОГИКА ДЛЯ СЕРВЕРА ===
 if [ "$ROLE" == "server" ]; then
     echo ">>> НАСТРОЙКА SERVER (Net $ID) <<<"
+    echo ">>> IP СЕРВЕРА БУДЕТ: $SERVER_IP <<<"
     
     # 2.1 Настройка сети
     cat <<EOF > /etc/sysconfig/network-scripts/ifcfg-$IFACE_INT
@@ -58,6 +62,8 @@ ONBOOT=yes
 IPADDR=$SERVER_IP
 PREFIX=24
 EOF
+    # Сброс IP перед рестартом во избежание конфликтов
+    ip addr flush dev $IFACE_INT
     systemctl restart network
 
     # 2.2 Копирование ключей
@@ -98,11 +104,19 @@ EOF
     # Находим WAN интерфейс (где есть инет)
     IFACE_WAN=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -n 1)
     
+    # Чистка старых правил
     systemctl start iptables
     iptables -t nat -F
     iptables -t nat -A POSTROUTING -s $VPN_SUBNET/24 -o $IFACE_WAN -j MASQUERADE
+    # Добавляем NAT для локальной сети тоже (на всякий случай)
     iptables -t nat -A POSTROUTING -s ${NET_PREFIX}.0/24 -o $IFACE_WAN -j MASQUERADE
+    # Открываем порт 1194 (чтобы наверняка)
+    iptables -I INPUT -p udp --dport 1194 -j ACCEPT
     service iptables save
+    
+    # Вырубаем firewalld (главного врага)
+    systemctl stop firewalld
+    systemctl disable firewalld
 
     # 2.5 Запуск
     systemctl enable openvpn-server@server
@@ -112,8 +126,9 @@ EOF
 # === [3] ЛОГИКА ДЛЯ КЛИЕНТА ===
 elif [ "$ROLE" == "client" ]; then
     echo ">>> НАСТРОЙКА CLIENT (Net $ID) <<<"
+    echo ">>> ЦЕЛЬ СЕРВЕР: $SERVER_IP <<<"
 
-    # 3.1 Настройка сети (Шлюз = IP Сервера)
+    # 3.1 Настройка сети (Шлюз = IP Сервера = .5)
     cat <<EOF > /etc/sysconfig/network-scripts/ifcfg-$IFACE_INT
 TYPE=Ethernet
 BOOTPROTO=static
@@ -125,12 +140,16 @@ PREFIX=24
 GATEWAY=$SERVER_IP
 DNS1=8.8.8.8
 EOF
+    # Сброс IP перед рестартом
+    ip addr flush dev $IFACE_INT
     systemctl restart network
     echo ">> Сеть перезапущена. Ждем 5 сек..."
     sleep 5
+    
+    # Принудительная чистка ARP (чтобы забыл старые MAC адреса шлюза)
+    ip neigh flush all
 
     # 3.2 Генерация конфига из локальных ключей
-    # Читаем содержимое файлов в переменные
     CA_DATA=$(cat $PKI_DIR/ca.crt)
     CERT_DATA=$(cat $PKI_DIR/issued/client$ID.crt)
     KEY_DATA=$(cat $PKI_DIR/private/client$ID.key)
